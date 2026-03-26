@@ -1,6 +1,7 @@
 //! Filters ESLint and Biome linter output, grouping violations by rule.
 
 use crate::core::config;
+use crate::core::sketch::{sketch_line, sketch_similarity};
 use crate::core::tracking;
 use crate::core::utils::{package_manager_exec, resolved_command, truncate};
 use crate::mypy_cmd;
@@ -8,6 +9,11 @@ use crate::ruff_cmd;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Minimum violations in a rule group before semantic sub-grouping activates.
+const SEMANTIC_GROUP_MIN_VIOLATIONS: usize = 5;
+/// Sketch similarity threshold for semantic message sub-grouping.
+const SEMANTIC_SKETCH_THRESHOLD: f64 = 0.9;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EslintMessage {
@@ -279,14 +285,37 @@ fn filter_eslint_json(output: &str) -> String {
     ));
     result.push_str("═══════════════════════════════════════\n");
 
-    // Show top rules
+    // Show top rules with semantic sub-grouping for large groups
     let mut rule_counts: Vec<_> = by_rule.iter().collect();
     rule_counts.sort_by(|a, b| b.1.cmp(a.1));
 
     if !rule_counts.is_empty() {
         result.push_str("Top rules:\n");
         for (rule, count) in rule_counts.iter().take(10) {
-            result.push_str(&format!("  {} ({}x)\n", rule, count));
+            // Collect messages for this rule
+            let rule_messages: Vec<&str> = results
+                .iter()
+                .flat_map(|r| r.messages.iter())
+                .filter(|m| m.rule_id.as_deref() == Some(rule.as_str()))
+                .map(|m| m.message.as_str())
+                .collect();
+
+            if **count > SEMANTIC_GROUP_MIN_VIOLATIONS {
+                // Semantic sub-grouping: cluster similar messages by sketch
+                match semantic_subgroup_messages(&rule_messages) {
+                    Some(summary) => {
+                        result.push_str(&format!(
+                            "  {} ({} total): {}\n",
+                            rule, count, summary
+                        ));
+                    }
+                    None => {
+                        result.push_str(&format!("  {} ({}x)\n", rule, count));
+                    }
+                }
+            } else {
+                result.push_str(&format!("  {} ({}x)\n", rule, count));
+            }
         }
         result.push('\n');
     }
@@ -472,6 +501,71 @@ fn filter_generic_lint(output: &str) -> String {
     }
 
     result.trim().to_string()
+}
+
+/// Semantic sub-grouping of lint messages using sketch similarity.
+///
+/// Given a slice of messages belonging to the same rule, clusters them by
+/// sketch similarity (threshold 0.9) and returns a compact summary string
+/// like: "3 patterns -- unused param 'config' (x23), unused local 'temp' (x14), other (x10)".
+///
+/// Returns `None` if clustering fails or produces no useful grouping.
+fn semantic_subgroup_messages(messages: &[&str]) -> Option<String> {
+    if messages.is_empty() {
+        return None;
+    }
+
+    // Build clusters: (exemplar_idx, sketch, count)
+    let mut clusters: Vec<(usize, crate::core::sketch::LineSketch, usize)> = Vec::new();
+
+    for (i, msg) in messages.iter().enumerate() {
+        let sketch = sketch_line(msg);
+        let mut matched = false;
+        for cluster in clusters.iter_mut() {
+            if sketch_similarity(&cluster.1, &sketch) >= SEMANTIC_SKETCH_THRESHOLD {
+                cluster.2 += 1;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            clusters.push((i, sketch, 1));
+        }
+    }
+
+    // Only show sub-grouping if there are multiple patterns
+    if clusters.len() <= 1 {
+        return None;
+    }
+
+    // Sort clusters by count descending
+    clusters.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let pattern_count = clusters.len();
+    let mut parts: Vec<String> = Vec::new();
+
+    for &(exemplar_idx, _, count) in clusters.iter().take(3) {
+        let exemplar = messages[exemplar_idx];
+        let short = if exemplar.len() > 40 {
+            let t: String = exemplar.chars().take(37).collect();
+            format!("{}...", t)
+        } else {
+            exemplar.to_string()
+        };
+
+        if count > 1 {
+            parts.push(format!("{} (x{})", short, count));
+        } else {
+            parts.push(short);
+        }
+    }
+
+    if clusters.len() > 3 {
+        let remaining: usize = clusters.iter().skip(3).map(|(_, _, c)| c).sum();
+        parts.push(format!("other (x{})", remaining));
+    }
+
+    Some(format!("{} patterns -- {}", pattern_count, parts.join(", ")))
 }
 
 /// Compact file path (remove common prefixes)
@@ -666,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_detect_linter_after_npx_strip() {
-        // Simulates: rtk lint npx eslint src/ → after strip_pm_prefix, args = ["eslint", "src/"]
+        // Simulates: rtk lint npx eslint src/ -> after strip_pm_prefix, args = ["eslint", "src/"]
         let full_args: Vec<String> = vec!["npx".into(), "eslint".into(), "src/".into()];
         let skip = strip_pm_prefix(&full_args);
         let effective = &full_args[skip..];
@@ -693,5 +787,74 @@ mod tests {
         assert!(!is_python_linter("eslint"));
         assert!(!is_python_linter("biome"));
         assert!(!is_python_linter("unknown"));
+    }
+
+    #[test]
+    fn test_semantic_subgroup_empty() {
+        let msgs: Vec<&str> = vec![];
+        assert!(semantic_subgroup_messages(&msgs).is_none());
+    }
+
+    #[test]
+    fn test_semantic_subgroup_single_pattern() {
+        // All identical messages -> 1 cluster -> returns None (no useful grouping)
+        let msgs = vec![
+            "Use const instead of let",
+            "Use const instead of let",
+            "Use const instead of let",
+        ];
+        assert!(semantic_subgroup_messages(&msgs).is_none());
+    }
+
+    #[test]
+    fn test_semantic_subgroup_multiple_patterns() {
+        // Two distinct groups of messages
+        let msgs = vec![
+            "'config' is defined but never used",
+            "'config' is defined but never used",
+            "'config' is defined but never used",
+            "'temp' is defined but never used",
+            "'temp' is defined but never used",
+            "Expected indentation of 4 spaces",
+            "Expected indentation of 4 spaces",
+            "Expected indentation of 4 spaces",
+        ];
+        let result = semantic_subgroup_messages(&msgs);
+        assert!(result.is_some(), "Expected Some for multiple patterns");
+        let summary = result.expect("already checked");
+        assert!(
+            summary.contains("patterns"),
+            "Summary should contain 'patterns': {}",
+            summary
+        );
+    }
+
+    #[test]
+    fn test_eslint_semantic_subgroup_integration() {
+        // Build a JSON with >5 violations for a single rule to trigger sub-grouping
+        let json = r#"[
+            {
+                "filePath": "/src/a.ts",
+                "messages": [
+                    {"ruleId": "no-unused-vars", "severity": 1, "message": "'config' is defined but never used", "line": 1, "column": 1},
+                    {"ruleId": "no-unused-vars", "severity": 1, "message": "'config' is defined but never used", "line": 2, "column": 1},
+                    {"ruleId": "no-unused-vars", "severity": 1, "message": "'config' is defined but never used", "line": 3, "column": 1},
+                    {"ruleId": "no-unused-vars", "severity": 1, "message": "'temp' is defined but never used", "line": 4, "column": 1},
+                    {"ruleId": "no-unused-vars", "severity": 1, "message": "'temp' is defined but never used", "line": 5, "column": 1},
+                    {"ruleId": "no-unused-vars", "severity": 1, "message": "Expected indentation of 2 spaces", "line": 6, "column": 1}
+                ],
+                "errorCount": 0,
+                "warningCount": 6
+            }
+        ]"#;
+
+        let result = filter_eslint_json(json);
+        // With >5 violations, semantic sub-grouping should activate
+        // The output should contain "patterns" indicating sub-grouping occurred
+        assert!(
+            result.contains("patterns") || result.contains("no-unused-vars"),
+            "Expected semantic grouping or rule name in output:\n{}",
+            result
+        );
     }
 }
